@@ -1,4 +1,5 @@
 {
+  "version": 1,
   "shards": {
     "shard-a": ["n1", "n2", "n3"],
     "shard-b": ["n2", "n3", "n4"],

@@ -13,6 +13,7 @@ import threading
 from contextlib import contextmanager
 from typing import Iterable
 
+from .manifest import Manifest
 from .models import LatestReport, PermitRecord, now_utc, parse_iso, to_iso
 
 SCHEMA = """
@@ -35,6 +36,12 @@ CREATE TABLE IF NOT EXISTS permits (
     finished_at TEXT,
     boot_ids_at_approval TEXT NOT NULL    -- JSON 对象 node -> boot_id
 );
+
+CREATE TABLE IF NOT EXISTS manifests (
+    version INTEGER PRIMARY KEY,          -- 已提交清单版本号，严格递增
+    shards TEXT NOT NULL,                 -- JSON 对象 shard -> [voter...]
+    applied_at TEXT NOT NULL              -- 服务端提交时间
+);
 """
 
 # 每个节点取采样时间最新的一份；采样时间并列时取后写入的一条。
@@ -49,6 +56,24 @@ FROM (
 ) t
 WHERE rn = 1
 """
+
+
+class _Transaction:
+    """写事务句柄：可在提交成功后、释放锁前执行回调。
+
+    清单切换需要“数据库落盘成功之后、其他请求看到旧内存清单之前”
+    更新内存中的生效清单，保证两者顺序一致；提交失败则不执行回调。
+    """
+
+    def __init__(self) -> None:
+        self._after_commit: list = []
+
+    def after_commit(self, fn) -> None:
+        self._after_commit.append(fn)
+
+    def _run_after_commit(self) -> None:
+        for fn in self._after_commit:
+            fn()
 
 
 class Store:
@@ -70,16 +95,36 @@ class Store:
             self._conn.close()
 
     @contextmanager
+    def guard(self):
+        """只拿应用内锁、不开数据库事务。
+
+        用于“按当前生效清单校验 + 紧随其后的写入”需要原子衔接、
+        但写入自带事务的场景（如探活上报）。
+        """
+        with self._lock:
+            yield
+
+    @contextmanager
     def transaction(self):
-        """写事务：BEGIN IMMEDIATE 立即拿写锁，并发申请在此串行。"""
+        """写事务：BEGIN IMMEDIATE 立即拿写锁，并发申请在此串行。
+
+        生产环境单进程单连接，应用内锁保证同进程串行；BEGIN IMMEDIATE
+        让未来的多进程部署也能在数据库层面串行化，守住多数票。
+        """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
+            tx = _Transaction()
             try:
-                yield
+                yield tx
+                self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                try:
+                    self._conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    # COMMIT 自身失败时事务可能已结束，回滚报错不应掩盖原异常
+                    pass
                 raise
-            self._conn.execute("COMMIT")
+            tx._run_after_commit()
 
     # ---- 探活报告 ----
 
@@ -168,4 +213,36 @@ class Store:
                 "UPDATE permits SET status = 'finished', finished_at = ? "
                 "WHERE request_id = ?",
                 (to_iso(finished_at), request_id),
+            )
+
+    # ---- 清单 ----
+
+    @staticmethod
+    def _row_to_manifest(row: sqlite3.Row) -> Manifest:
+        return Manifest(
+            shards={
+                name: tuple(voters)
+                for name, voters in json.loads(row["shards"]).items()
+            },
+            version=row["version"],
+        )
+
+    def latest_manifest(self) -> Manifest | None:
+        """最近一次已提交的清单；从未切换过则返回 None。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT version, shards FROM manifests ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+        return self._row_to_manifest(row) if row else None
+
+    def insert_manifest(self, manifest: Manifest, applied_at) -> None:
+        """写入新版本清单。主键冲突（并发/重复版本）由调用方回滚。"""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO manifests (version, shards, applied_at) VALUES (?,?,?)",
+                (
+                    manifest.version,
+                    json.dumps({n: list(v) for n, v in manifest.shards.items()}),
+                    to_iso(applied_at),
+                ),
             )

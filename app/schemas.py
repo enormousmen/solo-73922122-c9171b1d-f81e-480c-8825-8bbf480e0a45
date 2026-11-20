@@ -28,3 +28,19 @@ class LivenessBatchIn(BaseModel):
 class PermitRequestIn(BaseModel):
     request_id: str = Field(min_length=1, max_length=128, description="申请号")
     nodes: list[str] = Field(min_length=1, max_length=5000, description="拟重启节点")
+
+
+class ManifestSwitchIn(BaseModel):
+    """切换清单：携带当前版本号与完整的新清单。"""
+
+    current_version: int = Field(ge=1, description="调用方看到的当前清单版本号")
+    shards: dict[str, list[str]] = Field(
+        description="完整的新清单：分片名 -> 投票副本节点列表"
+    )
+
+    @field_validator("shards")
+    @classmethod
+    def _reject_empty(cls, v: dict[str, list[str]]) -> dict[str, list[str]]:
+        if not v:
+            raise ValueError("shards 不能为空")
+        return v

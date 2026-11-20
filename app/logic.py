@@ -1,4 +1,4 @@
-"""许可批准 / 结束的判定逻辑（纯函数，便于单测）。"""
+"""许可批准 / 结束 / 清单切换的判定逻辑（纯函数，便于单测）。"""
 from __future__ import annotations
 
 from .manifest import Manifest
@@ -80,6 +80,83 @@ def evaluate_permit_request(
             ]
         if affected_shards:
             detail["affected_shards"] = affected_shards
+    return ok, detail
+
+
+def evaluate_manifest_switch(
+    current: Manifest,
+    new: Manifest,
+    latest: dict[str, LatestReport],
+    open_permits: list[PermitRecord],
+) -> tuple[bool, dict]:
+    """校验清单切换。返回 (是否允许, 详情)。
+
+    条件（同时满足）：
+    1. 每个未结束许可占用的节点仍出现在新清单中；
+    2. 新清单中“新增的分片”与“投票成员发生变化的分片”，在扣除
+       未结束许可占用节点、健康未知或异常节点后，剩余可用投票副本仍过半。
+       未变动的分片不重新判定，避免切换被历史状态误伤。
+
+    票数不足时列出对应分片；否则 detail 为 {"ok": True, ...}。
+    """
+    open_nodes: set[str] = set()
+    for p in open_permits:
+        open_nodes.update(p.nodes)
+    new_nodes = new.nodes
+
+    missing_occupied = sorted(open_nodes - new_nodes)
+    shards_requiring_quorum = {
+        name
+        for name, voters in new.shards.items()
+        if name not in current.shards or current.shards[name] != voters
+    }
+
+    unavailable: dict[str, str] = {}
+    for n in sorted(open_nodes):
+        unavailable[n] = "occupied_by_open_permit"
+    for n in sorted(new_nodes):
+        if n in unavailable:
+            continue
+        rep = latest.get(n)
+        if rep is None:
+            unavailable[n] = "health_unknown"
+        elif not rep.healthy:
+            unavailable[n] = "unhealthy"
+
+    affected_shards = []
+    for shard in sorted(shards_requiring_quorum):
+        voters = new.shards[shard]
+        available = [v for v in voters if v not in unavailable]
+        needed = new.majority_needed(shard)
+        if len(available) < needed:
+            affected_shards.append(
+                {
+                    "shard": shard,
+                    "voters": len(voters),
+                    "required_available": needed,
+                    "available": len(available),
+                    "available_nodes": available,
+                    "excluded": {v: unavailable[v] for v in voters if v in unavailable},
+                }
+            )
+
+    ok = not (missing_occupied or affected_shards)
+    detail: dict = {
+        "ok": ok,
+        "checked_shards": sorted(shards_requiring_quorum),
+    }
+    if missing_occupied:
+        detail["error"] = "manifest_switch_rejected"
+        detail["missing_occupied_nodes"] = [
+            {
+                "node": n,
+                "permits": sorted(p.request_id for p in open_permits if n in p.nodes),
+            }
+            for n in missing_occupied
+        ]
+    if affected_shards:
+        detail.setdefault("error", "manifest_switch_rejected")
+        detail["affected_shards"] = affected_shards
     return ok, detail
 
 
